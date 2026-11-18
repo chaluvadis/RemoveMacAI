@@ -1,4 +1,5 @@
 import Foundation
+import UAF
 
 /// Checks the parts that must never go wrong, runnable without Xcode:
 /// `removemacai selftest`. Touches nothing on the system.
@@ -13,18 +14,82 @@ func selfTest() -> Bool {
     return false
   }
 
-  check(Set(Catalog.setsToRemove(keeping: [])) == Set(Catalog.modelSets.map(\.name)),
-    "off removes every model set")
+  check(unknownOption(in: ["RemoveMacAI.mobileconfig", "--bogus"]) == "--bogus"
+    && unknownOption(in: ["RemoveMacAI.mobileconfig", "analytics"]) == nil,
+    "export distinguishes unknown options from tweak names")
+  let invalidProfile = FileManager.default.temporaryDirectory
+    .appendingPathComponent("removemacai-export-selftest-\(UUID().uuidString).mobileconfig")
+  defer { try? FileManager.default.removeItem(at: invalidProfile) }
+  let executable = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
+  let invalidExport = Shell.run(executable, ["export", invalidProfile.path, "--bogus"])
+  let invalidExportOutput = invalidExport.output.replacingOccurrences(
+    of: #"\x1B\[[0-9;]*m"#, with: "", options: .regularExpression)
+  check(!invalidExport.ok && invalidExportOutput.contains("error: unknown option --bogus")
+    && !FileManager.default.fileExists(atPath: invalidProfile.path),
+    "export rejects unknown options without writing a profile")
+  let featuresJSON = Shell.run(executable, ["features", "--json"])
+  let featureRows = (try? JSONSerialization.jsonObject(with: Data(featuresJSON.output.utf8)) as? [[String: String]]) ?? []
+  check(featuresJSON.ok && featureRows.count == Catalog.availableFeatures.count
+    && featureRows.allSatisfy { Set($0.keys) == ["id", "title"] }
+    && Set(featureRows.compactMap { $0["id"] }) == Set(Catalog.availableFeatures.map(\.id)),
+    "features --json lists each feature's id and title for scripts")
+
+  check(unknownCommandMessage("stauts") == "unknown command \"stauts\". Did you mean \"status\"?"
+    && unknownCommandMessage("xyzzy") == "unknown command \"xyzzy\"",
+    "an unknown command names the typo and only suggests a close match")
+  let unknownCommand = Shell.run(executable, ["stauts"])
+  let unknownCommandOutput = unknownCommand.output.replacingOccurrences(
+    of: #"\x1B\[[0-9;]*m"#, with: "", options: .regularExpression)
+  check(unknownCommand.status == 1 && unknownCommandOutput.contains("error: unknown command \"stauts\"")
+    && unknownCommandOutput.contains("Did you mean \"status\"?"),
+    "an unknown command fails naming the typo instead of printing bare usage")
+  let unknownAction = Shell.run(executable, ["background", "of"])
+  let unknownActionOutput = unknownAction.output.replacingOccurrences(
+    of: #"\x1B\[[0-9;]*m"#, with: "", options: .regularExpression)
+  check(unknownAction.status == 1
+    && unknownActionOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "error: unknown action \"of\", use off or on",
+    "background fails on an unknown action instead of listing items")
+
+  check(Set(Catalog.setsToRemove(keeping: [])) == Set(Catalog.availableModelSets.map(\.name)),
+    "off removes every model set this macOS has")
   let keptWriting = Catalog.setsToRemove(keeping: ["writing-tools"])
-  check(!keptWriting.contains(Catalog.foundationModels) && keptWriting.contains(Catalog.spatialModels),
+  check(!keptWriting.contains(Catalog.foundationModels) && keptWriting.contains(Catalog.visualModels),
     "a kept feature keeps the models it needs, and only those")
-  check(Catalog.setsToRemove(keeping: Set(Catalog.features.map(\.id))).isEmpty,
+  check(Catalog.setsToRemove(keeping: Set(Catalog.availableFeatures.map(\.id))).isEmpty,
     "keeping everything removes nothing")
   check(Catalog.features.allSatisfy { $0.modelSets.allSatisfy { Catalog.modelSet($0) != nil } },
     "every model set a feature names is in the catalog")
   check(Set(Catalog.features.map(\.id)).count == Catalog.features.count, "feature names are unique")
+  check(Catalog.availableFeatures.allSatisfy(\.supported)
+    && Catalog.availableFeatures.count + Catalog.features.filter { !$0.supported }.count == Catalog.features.count,
+    "only Apple Intelligence features this macOS has are offered")
+  check(Catalog.availableModelSets.allSatisfy { set in
+    Catalog.availableFeatures.contains { $0.modelSets.contains(set.name) }
+  }, "only model sets a supported feature needs are offered")
+  check(Catalog.setsToRemove(keeping: []).allSatisfy { Catalog.availableModelSets.map(\.name).contains($0) },
+    "off never targets a model set this macOS does not have")
   check(throwsFailure { try Models.remove([]) }, "an empty removal is refused before anything is sent")
   check(throwsFailure { try Models.remove(["com.apple.something.else"]) }, "an unknown set is refused")
+  let lockError = NSError(
+    domain: "com.apple.UnifiedAssetFramework", code: -1,
+    userInfo: [NSLocalizedDescriptionKey: "Could not eliminate as there are current locks", "currentLockUsage": [:]])
+  check(Models.isLocked(lockError), "the asset service's lock error is recognised")
+  check(!Models.isLocked(NSError(domain: "com.apple.UnifiedAssetFramework", code: -1)), "other errors are not taken for a lock")
+  check(UAFRefusedConnection(NSError(domain: NSCocoaErrorDomain, code: NSXPCConnectionInterrupted))
+    && UAFRefusedConnection(NSError(domain: NSCocoaErrorDomain, code: NSXPCConnectionInvalid))
+    && !UAFRefusedConnection(lockError) && !UAFRefusedConnection(nil)
+    && !UAFRefusedConnection(NSError(domain: NSCocoaErrorDomain, code: NSXPCConnectionReplyInvalid)),
+    "a refused asset service connection is sent again through siriknowledged, other errors are not")
+  var attempts = 0
+  var waits: [TimeInterval] = []
+  let cleared = Models.retrying({ attempts += 1; return attempts < 3 ? .locked : .done }, delays: [5, 15]) { waits.append($0) }
+  check(cleared == .done && attempts == 3 && waits == [5, 15], "a locked set is asked again after each wait until it goes")
+  attempts = 0
+  let stuck = Models.retrying({ attempts += 1; return .locked }, delays: [5, 15]) { _ in }
+  check(stuck == .locked && attempts == 3, "a set that stays locked is tried three times, then reported")
+  attempts = 0
+  _ = Models.retrying({ attempts += 1; return .failed("x") }, delays: [5, 15]) { _ in }
+  check(attempts == 1, "other failures are not retried")
   let all = Catalog.modelSets.map(\.name)
   let types = Dictionary(uniqueKeysWithValues: Catalog.modelSets.map { ($0.name, $0.assetType) })
   let split = try? Models.matching(all) { $0 == Catalog.spatialModels ? "com.apple.something.else" : types[$0] }
@@ -138,7 +203,7 @@ func selfTest() -> Bool {
   }
 
   do {
-    let plist = try PropertyListSerialization.propertyList(from: Profile.data(keeping: []), format: nil)
+    let plist = try PropertyListSerialization.propertyList(from: Profile.data(Profile.Contents(ai: [], tweaks: [])), format: nil)
       as! [String: Any]
     let payloads = plist["PayloadContent"] as! [[String: Any]]
     let restrictions = payloads.first { $0["PayloadType"] as? String == "com.apple.applicationaccess" }!
@@ -147,19 +212,359 @@ func selfTest() -> Bool {
     let blocks = payloads.first { ($0["PayloadIdentifier"] as? String)?.hasSuffix(".com.apple.MobileAsset") == true }!
     let content = (blocks["PayloadContent"] as! [String: Any])["com.apple.MobileAsset"] as! [String: Any]
     let settings = ((content["Forced"] as! [[String: Any]])[0]["mcx_preference_settings"]) as! [String: String]
-    check(settings.count == Catalog.modelSets.count && settings.values.allSatisfy { $0.hasPrefix("https://127.0.0.1:9/") },
+    check(settings.count == Catalog.availableModelSets.count && settings.values.allSatisfy { $0.hasPrefix("https://127.0.0.1:9/") },
       "the profile blocks downloads for every removed set")
     let uuids = payloads.compactMap { $0["PayloadUUID"] as? String } + [plist["PayloadUUID"] as! String]
     check(Set(uuids).count == uuids.count && Profile.uuid("a") == Profile.uuid("a"),
       "payload UUIDs are unique and stable")
+    let marker = payloads.first { ($0["PayloadIdentifier"] as? String)?.hasSuffix(".\(Profile.identifier)") == true }!
+    let recorded = ((((marker["PayloadContent"] as! [String: Any])[Profile.identifier] as! [String: Any])["Forced"]
+      as! [[String: Any]])[0]["mcx_preference_settings"] as! [String: Any])["features"] as? String
+    check(recorded == Catalog.availableFeatures.map(\.id).sorted().joined(separator: ","),
+      "the profile records the features it was made for")
+    let all = Set(Catalog.availableFeatures.map(\.id))
+    check(Profile.Installed(on: true, ai: true, features: all.subtracting(["siri"])).stale
+      && !Profile.Installed(on: true, ai: true, features: all).stale
+      && !Profile.Installed(on: true, ai: true).stale
+      && Profile.Installed(on: true, ai: true, features: []).contents?.ai == nil,
+      "a profile made before macOS gained features is installed again")
 
-    let keep = try PropertyListSerialization.propertyList(from: Profile.data(keeping: ["writing-tools"]), format: nil)
+    let keep = try PropertyListSerialization.propertyList(from: Profile.data(Profile.Contents(ai: ["writing-tools"], tweaks: [])), format: nil)
       as! [String: Any]
     let kr = (keep["PayloadContent"] as! [[String: Any]]).first { $0["PayloadType"] as? String == "com.apple.applicationaccess" }!
     check(kr["allowWritingTools"] == nil && kr["allowGenmoji"] as? Bool == false, "a kept feature is left alone")
   } catch {
     check(false, "the profile builds: \(error)")
   }
+
+  do {
+    check(Mobile.Device(argument: "ios") == .iPhone && Mobile.Device(argument: "ipados") == .iPad
+      && Mobile.Device(argument: "phone") == nil,
+      "iphone and ipad profile targets accept the OS names")
+    check(Set(Mobile.features.map(\.id)).count == Mobile.features.count, "iPhone and iPad feature names are unique")
+    let phone = try PropertyListSerialization.propertyList(from: Mobile.data(keeping: [], device: .iPhone), format: nil) as! [String: Any]
+    let pad = try PropertyListSerialization.propertyList(from: Mobile.data(keeping: ["writing-tools"], device: .iPad), format: nil) as! [String: Any]
+    check(phone["PayloadScope"] == nil && pad["PayloadScope"] == nil
+      && phone["PayloadRemovalDisallowed"] as? Bool == false,
+      "an iPhone or iPad profile is removable and is not a Mac system profile")
+    let phonePayloads = phone["PayloadContent"] as! [[String: Any]]
+    let padPayloads = pad["PayloadContent"] as! [[String: Any]]
+    let phoneRestrictions = phonePayloads[0]
+    let padRestrictions = padPayloads[0]
+    check(phonePayloads.count == 1 && phonePayloads[0]["PayloadType"] as? String == "com.apple.applicationaccess"
+      && padPayloads.count == 1,
+      "an iPhone profile carries restrictions only, with no Mac preference payloads")
+    check(phoneRestrictions["allowWritingTools"] as? Bool == false
+      && phoneRestrictions["allowAssistant"] as? Bool == false
+      && phoneRestrictions["allowSiriAI"] as? Bool == false
+      && phoneRestrictions["allowImageWand"] as? Bool == false
+      && phoneRestrictions["allowVisualIntelligenceSummary"] as? Bool == false
+      && phoneRestrictions["allowDiagnosticSubmission"] == nil,
+      "an iPhone profile turns Writing Tools, Siri, Image Wand, and Visual Intelligence summaries off")
+    check(padRestrictions["allowWritingTools"] == nil
+      && padRestrictions["allowGenmoji"] as? Bool == false
+      && padRestrictions["allowImageWand"] as? Bool == false
+      && padRestrictions["allowExternalIntelligenceIntegrations"] as? Bool == false
+      && padRestrictions["allowVisualIntelligenceSummary"] as? Bool == false,
+      "a kept iPad feature is left alone and iPad turns Visual Intelligence summaries off")
+    let phoneDescription = phone["PayloadDescription"] as? String ?? ""
+    check(phoneDescription.contains("Mail can still write them on its own")
+      && phoneDescription.contains("Visual Intelligence summaries")
+      && phoneDescription.contains("Shared iPad ignores them")
+      && !phoneDescription.contains("any device"),
+      "the profile names its Mail and Visual Intelligence limits and does not promise Siri AI on Shared iPad")
+  } catch {
+    check(false, "the iPhone and iPad profiles build: \(error)")
+  }
+  // The debloater catalog.
+  check(Set(Tweaks.all.map(\.id)).count == Tweaks.all.count, "tweak names are unique")
+  let changeKeys = Tweaks.all.flatMap { $0.changes.map(\.key) }
+  check(Set(changeKeys).count == changeKeys.count, "no two tweaks change the same setting")
+  check(Tweaks.all.allSatisfy { !$0.changes.isEmpty && ($0.changes.allSatisfy(\.inProfile) || !$0.inProfile) },
+    "a tweak is either all profile or all local")
+  // Restriction keys Apple only accepts from an MDM server; one of these
+  // makes macOS reject the whole profile (device-management Release-v27.0).
+  let mdmOnly: Set<String> = [
+    "allowedExternalIntelligenceWorkspaceIDs", "allowRosettaUsageAwareness", "allowSafariHistoryClearing",
+    "allowSafariPrivateBrowsing", "forceBypassScreenCaptureAlert",
+  ]
+  let profileKeys = Tweaks.all.flatMap(\.changes).compactMap { c -> String? in
+    if case .restriction(let k) = c { return k } else { return nil }
+  } + Catalog.features.flatMap(\.restrictions)
+  check(mdmOnly.isDisjoint(with: profileKeys), "the profile uses no key that needs an MDM server")
+  check(Set(Tweaks.preset(.recommended).map(\.id)).isSubset(of: Set(Tweaks.preset(.privacy).map(\.id))),
+    "maximum privacy includes everything in recommended")
+  check(Set(Tweaks.all.map(\.id)).isDisjoint(with: Set(Catalog.features.map(\.id))),
+    "tweak names don't clash with Apple Intelligence feature names")
+  check(PlistValue.bool(true).matches(1 as NSNumber) && PlistValue.bool(false).matches(0 as NSNumber)
+    && !PlistValue.bool(true).matches(0 as NSNumber) && PlistValue.int(2).matches(2 as NSNumber)
+    && PlistValue.double(0).matches(0 as NSNumber) && !PlistValue.string("SCcf").matches(nil),
+    "stored values match whether they were written as bools or numbers")
+  check(PlistValue(kCFBooleanTrue) == .bool(true) && PlistValue(3 as NSNumber) == .int(3)
+    && PlistValue(0.5 as NSNumber) == .double(0.5) && PlistValue("a" as NSString) == .string("a"),
+    "stored values keep their types")
+  check(Change.pref("com.apple.dock", "autohide-delay", .double(0)).command
+    == "defaults write com.apple.dock \"autohide-delay\" -float 0.0", "commands are shown as defaults would take them")
+
+  do {
+    let contents = Profile.Contents(ai: nil, tweaks: ["analytics", "lookup-suggestions"])
+    let plist = try PropertyListSerialization.propertyList(from: Profile.data(contents), format: nil) as! [String: Any]
+    let payloads = plist["PayloadContent"] as! [[String: Any]]
+    let restrictions = payloads.first { $0["PayloadType"] as? String == "com.apple.applicationaccess" }
+    check(restrictions?["allowDiagnosticSubmission"] as? Bool == false && restrictions?["allowWritingTools"] == nil,
+      "a tweak-only profile restricts the tweaks and leaves Apple Intelligence alone")
+    check(!payloads.contains { ($0["PayloadIdentifier"] as? String)?.hasSuffix(".com.apple.MobileAsset") == true },
+      "a tweak-only profile blocks no model downloads")
+    let marker = payloads.first { ($0["PayloadIdentifier"] as? String)?.hasSuffix(".preferences.\(Profile.identifier)") == true }
+    let markerSettings = ((marker?["PayloadContent"] as? [String: Any])?[Profile.identifier] as? [String: Any])
+      .flatMap { ($0["Forced"] as? [[String: Any]])?.first?["mcx_preference_settings"] as? [String: Any] }
+    check(markerSettings?["ai"] as? Bool == false && markerSettings?["tweaks"] as? String == "analytics,lookup-suggestions",
+      "the profile records which tweaks it holds")
+    let lookup = payloads.first { ($0["PayloadIdentifier"] as? String)?.hasSuffix(".com.apple.lookup.shared") == true }
+    check(lookup != nil, "forced tweak preferences are in the profile")
+  } catch {
+    check(false, "the tweak profile builds: \(error)")
+  }
+
+  check(Storage.uniqueName("a.app", in: "/nonexistent-folder") == "a.app", "trash names stay as they are when free")
+  let script = BackgroundItem(label: "com.example.sync", plist: "", program: "/bin/bash",
+    arguments: ["/bin/bash", "/Users/x/bin/sync.sh"], system: false)
+  let helper = BackgroundItem(label: "dev.orbstack.OrbStack.privhelper", plist: "",
+    program: "/Library/PrivilegedHelperTools/dev.orbstack.OrbStack.privhelper", system: true)
+  check(script.owner == "sync.sh" && helper.owner == "OrbStack", "background items are named after what they run")
+  let goneApp = BackgroundItem(label: "com.example.gone", plist: "", program: "/Applications/Gone-\(UUID().uuidString).app/Contents/MacOS/helper", system: false)
+  let goneScript = BackgroundItem(label: "com.example.gone-script", plist: "", program: "/bin/bash",
+    arguments: ["/bin/bash", "/nonexistent-\(UUID().uuidString)/sync.sh"], system: false)
+  let present = BackgroundItem(label: "com.example.present", plist: "", program: "/bin/bash",
+    arguments: ["/bin/bash", "/bin/sh"], system: false)
+  let bare = BackgroundItem(label: "com.example.bare", plist: "", program: "helper", system: false)
+  check(goneApp.isLeftover && goneScript.isLeftover && !present.isLeftover && !bare.isLeftover,
+    "a background item is left over only when what it runs is gone")
+  let inline = BackgroundItem(label: "com.example.inline", plist: "", program: "/bin/bash",
+    arguments: ["/bin/bash", "-c", "echo ok", "/nonexistent-\(UUID().uuidString)"], system: false)
+  let inlineScript = BackgroundItem(label: "com.example.inline-script", plist: "", program: "/bin/sh",
+    arguments: ["/bin/sh", "-c", "/bin/sh --version"], system: false)
+  let optioned = BackgroundItem(label: "com.example.optioned", plist: "", program: "/bin/zsh",
+    arguments: ["/bin/zsh", "-l", "/nonexistent-\(UUID().uuidString)/sync.sh"], system: false)
+  check(!inline.isLeftover && !inlineScript.isLeftover && optioned.isLeftover,
+    "a command run with -c is never judged left over, and options before a script are skipped")
+  let locked = FileManager.default.temporaryDirectory.appendingPathComponent("removemacai-locked-\(UUID().uuidString)")
+  try? FileManager.default.createDirectory(at: locked, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o000])
+  defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path); try? FileManager.default.removeItem(at: locked) }
+  check(!BackgroundItem.confirmedMissing(locked.appendingPathComponent("helper").path)
+    && BackgroundItem.confirmedMissing("/nonexistent-\(UUID().uuidString)/helper"),
+    "a path RemoveMacAI can't look into doesn't count as missing")
+
+  let ranAll = Shell.run("/bin/sh", ["-c", Shell.adminScript(["false", "echo second"])])
+  check(!ranAll.ok && ranAll.output.contains("second"), "one failed administrator step doesn't skip the rest")
+  let exited = Shell.run("/bin/sh", ["-c", Shell.adminScript(["exit 3", "echo after-exit"])])
+  check(!exited.ok && exited.output.contains("after-exit"), "a step that exits doesn't stop the rest")
+  let toolFolder = FileManager.default.temporaryDirectory.appendingPathComponent("removemacai-cli-\(UUID().uuidString)")
+  defer { try? FileManager.default.removeItem(at: toolFolder) }
+  let toolLink = toolFolder.appendingPathComponent("bin/removemacai").path
+  let binary = "/Applications/Remove Mac AI's.app/Contents/MacOS/RemoveMacAI"
+  let linked = Shell.run("/bin/sh", ["-c", Shell.adminScript(CommandLineTool.commands(linking: binary, at: toolLink))])
+  let relinked = Shell.run("/bin/sh", ["-c", Shell.adminScript(CommandLineTool.commands(linking: binary, at: toolLink))])
+  check(linked.ok && relinked.ok && (try? FileManager.default.destinationOfSymbolicLink(atPath: toolLink)) == binary,
+    "the command line tool links to the app, even from a path with spaces and quotes")
+  let toolFile = toolFolder.appendingPathComponent("bin/other").path
+  FileManager.default.createFile(atPath: toolFile, contents: Data("keep".utf8))
+  let refused = Shell.run("/bin/sh", ["-c", Shell.adminScript(CommandLineTool.commands(linking: binary, at: toolFile))])
+  check(!refused.ok && refused.output.contains("isn't a link") && (try? String(contentsOfFile: toolFile, encoding: .utf8)) == "keep",
+    "the command line tool never replaces a file that isn't a link")
+  check(Shell.run("/bin/sh", ["-c", Shell.adminScript(["true", "true"])]).ok, "administrator steps succeed together")
+  check(Updates.isNewer("1.2.0", than: "1.2.0-beta.1") && !Updates.isNewer("1.1.4", than: "1.2.0-beta.1")
+    && Updates.isNewer("1.2.0-beta.10", than: "1.2.0-beta.9") && !Updates.isNewer("1.2.0-beta.1", than: "1.2.0")
+    && Updates.isNewer("1.10.0", than: "1.9.9") && !Updates.isNewer("1.1.4", than: "1.1.4"),
+    "update checks treat a beta as older than its release and compare numbers as numbers")
+  check(Updates.isVersion("1.2.0") && Updates.isVersion("1.2.0-beta.1") && !Updates.isVersion("")
+    && !Updates.isVersion("latest") && !Updates.isVersion("1.2.") && !Updates.isNewer("", than: "1.2.0"),
+    "an update check only accepts version numbers, and an empty one can't crash it")
+  check(Term.pad("abc", 5) == "abc  " && Term.pad("abcdef", 5) == "abcdef ", "columns never run together")
+  check(Term.colorEnabled(env: [:], tty: true) && !Term.colorEnabled(env: [:], tty: false),
+    "color follows the terminal when neither NO_COLOR nor CLICOLOR_FORCE is set")
+  check(!Term.colorEnabled(env: ["NO_COLOR": ""], tty: true)
+    && !Term.colorEnabled(env: ["NO_COLOR": "", "CLICOLOR_FORCE": "1"], tty: true),
+    "NO_COLOR turns color off, even when forced or on a terminal")
+  check(Term.colorEnabled(env: ["CLICOLOR_FORCE": "1"], tty: false)
+    && !Term.colorEnabled(env: ["CLICOLOR_FORCE": "0"], tty: true),
+    "CLICOLOR_FORCE turns color on and off regardless of the terminal")
+  check(Term.paint("x", "31", useColor: true).contains("\u{1B}[31m") && !Term.paint("x", "31", useColor: false).contains("\u{1B}"),
+    "stderr text is only colored when its own stream allows it")
+  check(Term.size(999_999_999) == "1.0 GB" && Term.size(999_500_000) == "1.0 GB"
+    && Term.size(999_499_999) == "999 MB" && Term.size(1_000_000_000) == "1.0 GB"
+    && Term.size(5_000_000) == "5 MB", "sizes that round to 1000 MB are shown in GB")
+  check(Storage.isAppleCache("/x/com.apple.Safari") && Storage.isAppleCache("/x/CloudKit")
+    && Storage.isAppleCache("/x/GeoServices") && !Storage.isAppleCache("/x/Homebrew")
+    && !Storage.isAppleCache("/x/com.google.Chrome"), "macOS caches without the com.apple. prefix are left alone")
+  check(Storage.soundLibraryUsers(["com.apple.finder": "Finder", "com.example.missing": "Missing"]) == ["Finder"],
+    "apps that share the sound library are found by bundle identifier")
+  let updater = BackgroundItem(label: "com.google.GoogleUpdater.wake", plist: "",
+    program: "/Users/x/Library/Application Support/Google/GoogleUpdater/Current/GoogleUpdater.app/Contents/MacOS/GoogleUpdater",
+    system: false)
+  check(updater.isUpdater && updater.warning == nil && !helper.isUpdater && helper.warning != nil,
+    "helpers that aren't updaters carry a warning")
+  let vpn = BackgroundItem(label: "com.example.vpn", plist: "", program: "/Library/Example Updates/vpnd",
+    arguments: ["/Library/Example Updates/vpnd", "--check-updates"], system: true)
+  check(!vpn.isUpdater && vpn.warning != nil, "an unrelated mention of updates keeps the warning")
+  MainActor.assumeIsolated {
+    let model = AppModel()
+    model.modelBytes = ["first": 5]
+    check(model.modelBytes(["first"]) == 5 && model.modelBytes(["first", "second"]) == nil,
+      "the review sheet shows a model size only when every set has a reading")
+  }
+  // The journal, in a temporary folder instead of the real one.
+  let realFolder = Engine.folder
+  let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("removemacai-selftest-\(UUID().uuidString)")
+  try? FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+  Engine.folder = scratch
+  for _ in 0..<2 {
+    try? Data("garbage".utf8).write(to: Engine.journalURL)
+    _ = Engine.loadJournal()
+  }
+  let kept = (try? FileManager.default.contentsOfDirectory(atPath: scratch.path)) ?? []
+  check(kept.filter { $0.hasPrefix("journal-unreadable-") }.count == 2 && Engine.journalBlocked == nil,
+    "unreadable journals are each kept aside under their own name")
+  if getuid() != 0 {
+    try? Data("garbage".utf8).write(to: Engine.journalURL)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: scratch.path)
+    _ = Engine.loadJournal()
+    Engine.save(Engine.Journal())
+    check(Engine.journalBlocked != nil && (try? Data(contentsOf: Engine.journalURL)) == Data("garbage".utf8)
+      && Engine.runLocal(Plan()) == [Engine.journalBlocked!],
+      "a journal that can't be moved aside is never overwritten and blocks changes")
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scratch.path)
+  }
+  try? FileManager.default.removeItem(at: scratch)
+  Engine.folder = realFolder
+  Engine.journalBlocked = nil
+
+  do {
+    let realApp = MusicLaunch.app
+    let realLaunchctl = Engine.launchctl
+    Engine.folder = scratch
+    MusicLaunch.app = scratch.appendingPathComponent("Music.app")
+    defer {
+      Engine.folder = realFolder
+      MusicLaunch.app = realApp
+      Engine.launchctl = realLaunchctl
+      try? FileManager.default.removeItem(at: scratch)
+    }
+    var disabled: Set<String> = ["com.example.unrelated"]
+    var running = Set<String>()
+    var failEnable = Set<String>()
+    var failStop = false
+    Engine.launchctl = { args in
+      let label = args.last?.split(separator: "/").last.map(String.init) ?? ""
+      switch args.first {
+      case "print-disabled":
+        return .init(status: 0, output: disabled.sorted().map { "\"\($0)\" => disabled" }.joined(separator: "\n"))
+      case "print": return .init(status: running.contains(label) ? 0 : 113, output: "")
+      case "disable": disabled.insert(label)
+      case "enable":
+        if failEnable.contains(label) { return .init(status: 5, output: "enable failed") }
+        disabled.remove(label)
+      case "bootout":
+        if failStop { return .init(status: 5, output: "stop failed") }
+        running.remove(label)
+      default: return .init(status: 1, output: "unexpected launchctl operation")
+      }
+      return .init(status: 0, output: "")
+    }
+    let tweak = Tweaks.tweak("music-launches")!
+    var journal = Engine.Journal()
+    check(tweak.presets.isEmpty && !tweak.inProfile,
+      "blocking manual Music launches is opt-in and needs no profile")
+    check(!Engine.apply(tweak, journal: &journal).isEmpty && journal.entries.isEmpty
+      && disabled == ["com.example.unrelated"],
+      "missing Music files fail without disabling an unrelated job")
+    do {
+      let executable = MusicLaunch.app.appendingPathComponent("Contents/MacOS/Music")
+      try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try Data("first".utf8).write(to: executable)
+      let first = try MusicLaunch.label()
+      running.insert(first)
+      check(Engine.apply(tweak, journal: &journal).isEmpty && disabled.contains(first) && running.isEmpty
+        && Snapshot().state(tweak) == .applied,
+        "applying the Music tweak disables its launch entry and closes the running app")
+      try FileManager.default.moveItem(at: executable, to: scratch.appendingPathComponent("old-Music"))
+      try Data("replacement".utf8).write(to: executable)
+      let second = try MusicLaunch.label()
+      check(first != second && Snapshot().state(tweak) == .partial,
+        "replacing Music changes its launch entry and leaves the tweak visibly partial")
+      check(Engine.apply(tweak, journal: &journal).isEmpty && disabled.contains(second)
+        && Set(MusicLaunch.recordedLabels(tweak.id, journal: journal)) == [first, second],
+        "reapply blocks the replacement and retains the old entry for undo")
+      Engine.save(journal)
+      failEnable.insert(first)
+      check(!Engine.revertAll().isEmpty && disabled.contains(first) && !disabled.contains(second)
+        && MusicLaunch.recordedLabels(tweak.id, journal: Engine.loadJournal()) == [first],
+        "failed undo keeps only the failed entry for retry while restoring the others")
+      failEnable.removeAll()
+      check(Engine.revertAll().isEmpty && disabled == ["com.example.unrelated"]
+        && Engine.loadJournal().entries.isEmpty && Snapshot().state(tweak) == .notApplied,
+        "retry restores all Music launch entries and leaves unrelated jobs alone")
+      journal = Engine.Journal()
+      disabled.insert(second)
+      check(Engine.apply(tweak, journal: &journal).isEmpty && Engine.apply(tweak, journal: &journal).isEmpty
+        && Engine.revert(tweak, journal: &journal).isEmpty && disabled.contains(second) && journal.entries.isEmpty,
+        "undo preserves a Music entry that was disabled before applying, even after reapply")
+      disabled.remove(second)
+      running.insert(second)
+      failStop = true
+      check(!Engine.apply(tweak, journal: &journal).isEmpty && disabled.contains(second) && running.contains(second)
+        && Snapshot().state(tweak) == .partial,
+        "failure to stop a running Music app is reported and remains repairable")
+      failStop = false
+      check(Engine.apply(tweak, journal: &journal).isEmpty && running.isEmpty
+        && Engine.revert(tweak, journal: &journal).isEmpty && disabled == ["com.example.unrelated"],
+        "a failed stop can be retried without overwriting the original enabled state")
+    } catch { check(false, "Music launch lifecycle: \(error)") }
+  }
+
+  // Partly applied tweaks are the person's own settings until they ask.
+  var s = Snapshot()
+  s.profile = Profile.Installed(on: true, ai: false, kept: [], tweaks: ["analytics"])
+  let states: [String: TweakState] = ["smart-punctuation": .partial, "autocorrect": .applied, "analytics": .partial]
+  let fake: (Tweak) -> TweakState = { states[$0.id] ?? .notApplied }
+  let applyOne = Plan.make(wanted: ["autocorrect", "file-extensions"], ai: nil, snapshot: s, state: fake)
+  check(applyOne.apply.map(\.id) == ["file-extensions"] && applyOne.revert.isEmpty && applyOne.profile == nil,
+    "applying a tweak leaves partly applied ones and the profile alone")
+  let undoOne = Plan.make(wanted: ["autocorrect"], ai: nil, undo: ["smart-punctuation"], snapshot: s, state: fake)
+  check(undoOne.revert.map(\.id) == ["smart-punctuation"] && undoOne.profile == nil,
+    "a partly applied tweak is undone when named")
+  let undoLocked = Plan.make(wanted: ["autocorrect"], ai: nil, undo: ["analytics"], snapshot: s, state: fake)
+  check(undoLocked.profile?.tweaks == [] && undoLocked.revert.map(\.id) == ["analytics"],
+    "a partly applied profile tweak leaves the profile when named")
+
+  MainActor.assumeIsolated {
+    let model = AppModel()
+    let partialTweak = Tweaks.tweak("smart-punctuation")!
+    model.states = Dictionary(uniqueKeysWithValues: Tweaks.all.map { ($0.id, TweakState.notApplied) })
+    model.states[partialTweak.id] = .partial
+    model.wanted = []
+    model.touched = []
+    model.toggle(partialTweak, false)
+    check(model.pendingTweaks.isEmpty, "switching off a partly applied tweak that is already off changes nothing")
+    model.toggle(partialTweak, true)
+    model.leave(partialTweak)
+    check(model.pendingTweaks.isEmpty, "leaving a partly applied tweak drops an earlier selection")
+    model.toggle(partialTweak, true)
+    model.toggle(partialTweak, false)
+    check(model.pendingTweaks.map(\.tweak.id) == [partialTweak.id] && model.pendingTweaks.first?.apply == false,
+      "switching a partly applied tweak on and off undoes it")
+  }
+
+  let macUpdate: [String: Any] = ["Display Name": "macOS 27.2", "Display Version": "27.2"]
+  let toolsUpdate: [String: Any] = ["Display Name": "Command Line Tools for Xcode 27.2", "Display Version": "27.2"]
+  check(PendingUpdate.name(in: ["RecommendedUpdates": [toolsUpdate, macUpdate]], running: "27.0") == "macOS 27.2",
+    "a pending macOS update is found among other updates")
+  check(PendingUpdate.name(in: ["RecommendedUpdates": [toolsUpdate]], running: "27.0") == nil
+    && PendingUpdate.name(in: ["RecommendedUpdates": [macUpdate]], running: "27.2") == nil
+    && PendingUpdate.name(in: [:], running: "27.0") == nil,
+    "other updates, the running version and an empty list don't count as a pending macOS update")
+  check(PendingUpdate.slowedBy(Profile.Installed()) == nil, "no update warning without the profile")
+
   print(failed == 0 ? Term.green("all checks passed") : Term.red("\(failed) failed"))
   return failed == 0
 }

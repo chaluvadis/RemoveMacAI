@@ -43,14 +43,51 @@ enum Models {
   }
 
   /// Whether anything of the set may still be on disk: tracked bytes, or files
-  /// in its asset folder. A folder macOS will not let us read counts as present.
+  /// in its asset folder.
   static func present(_ set: String) -> Bool {
     if (bytes(set) ?? 0) > 0 { return true }
     guard let model = Catalog.modelSet(set) else { return false }
-    let path = "/System/Library/AssetsV2/" + model.assetType.replacingOccurrences(of: ".", with: "_")
-    guard FileManager.default.fileExists(atPath: path) else { return false }
-    guard let items = try? FileManager.default.contentsOfDirectory(atPath: path) else { return true }
-    return !items.isEmpty
+    return folderHoldsFiles(model.assetType)
+  }
+
+  /// Whether a set's asset folder may still hold model files. macOS will not
+  /// list some of these folders, even to an admin, but it still says how many
+  /// entries a folder has and whether a named entry exists, so only those are
+  /// used. Once the models are removed, a folder keeps at most purpose_auto with
+  /// the catalog <folder>.xml and its .purged copy. Anything else, a count
+  /// macOS will not give, or a purpose_auto that changes while it is checked,
+  /// counts as files. Only a folder that is surely missing counts as empty.
+  static func folderHoldsFiles(_ assetType: String, root: String = "/System/Library/AssetsV2") -> Bool {
+    let name = assetType.replacingOccurrences(of: ".", with: "_")
+    let folder = root + "/" + name
+    var info = stat()
+    if lstat(folder, &info) != 0 { return errno != ENOENT }
+    let files = FileManager.default
+    guard let top = entryCount(folder) else { return true }
+    let purpose = folder + "/purpose_auto"
+    guard files.fileExists(atPath: purpose) else { return top > 0 }
+    guard let before = modified(purpose), let inner = entryCount(purpose) else { return true }
+    let catalog = [name + ".xml", name + ".xml.purged"].filter { files.fileExists(atPath: purpose + "/" + $0) }
+    guard let after = modified(purpose), after == before else { return true }
+    return top > 1 || inner > catalog.count
+  }
+
+  /// Entries in a folder, from its attributes rather than a listing, or nil.
+  /// Anything but a folder gets no count back, so it gets nil too.
+  static func entryCount(_ path: String) -> Int? {
+    var request = attrlist()
+    request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
+    request.dirattr = attrgroup_t(ATTR_DIR_ENTRYCOUNT)
+    var reply: (length: UInt32, count: UInt32) = (0, 0)
+    let status = withUnsafeMutableBytes(of: &reply) { getattrlist(path, &request, $0.baseAddress, $0.count, 0) }
+    return status == 0 && reply.length >= UInt32(MemoryLayout.size(ofValue: reply)) ? Int(reply.count) : nil
+  }
+
+  /// When a folder's entries last changed, or nil.
+  static func modified(_ path: String) -> (seconds: Int, nanoseconds: Int)? {
+    var info = stat()
+    guard stat(path, &info) == 0 else { return nil }
+    return (info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec)
   }
 
   /// A total is only known when every selected set answered.
@@ -89,24 +126,57 @@ enum Models {
   /// catalog, and leaves alone any set whose asset type no longer matches it.
   /// Returns the sets that stayed, with the reason.
   @discardableResult
-  static func remove(_ sets: [String], timeout: TimeInterval = 120) throws -> [(String, String)] {
+  static func remove(_ sets: [String], timeout: TimeInterval = 120, retryDelays: [TimeInterval] = [5, 15]) throws
+    -> [(String, String)]
+  {
     guard !sets.isEmpty else { throw Failure("no model sets selected") }
     var (matched, failed) = try matching(sets)
     for name in matched where present(name) {
-      let done = DispatchSemaphore(value: 0)
-      var failure: NSError?
-      UAFResetAssetSets([name]) { error in
-        failure = error as NSError?
-        done.signal()
-      }
-      if done.wait(timeout: .now() + timeout) != .success {
-        failed.append((name, "no answer in \(Int(timeout)) seconds"))
-      } else if let failure {
-        let detail = failure.userInfo.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
-        failed.append((name, "\(failure.domain) \(failure.code) \(detail)"))
+      switch retrying({ reset(name, timeout: timeout) }, delays: retryDelays) {
+      case .done: break
+      case .locked: failed.append((name, lockedReason))
+      case .noAnswer: failed.append((name, "no answer in \(Int(timeout)) seconds"))
+      case .failed(let reason): if present(name) { failed.append((name, reason)) }
       }
     }
     return failed
+  }
+
+  /// Asks again after each delay while the set is locked.
+  static func retrying(
+    _ attempt: () -> ResetOutcome, delays: [TimeInterval], sleep: (TimeInterval) -> Void = Thread.sleep
+  ) -> ResetOutcome {
+    var outcome = attempt()
+    for delay in delays where outcome == .locked {
+      sleep(delay)
+      outcome = attempt()
+    }
+    return outcome
+  }
+
+  static let lockedReason =
+    "macOS is still using these models, so it wouldn't delete them yet. Restart your Mac, then run RemoveMacAI again to delete them."
+
+  enum ResetOutcome: Equatable {
+    case done, locked, noAnswer
+    case failed(String)
+  }
+
+  static func reset(_ name: String, timeout: TimeInterval) -> ResetOutcome {
+    let done = DispatchSemaphore(value: 0)
+    var failure: NSError?
+    UAFResetAssetSets([name]) { error in
+      failure = error as NSError?
+      done.signal()
+    }
+    if done.wait(timeout: .now() + timeout) != .success { return .noAnswer }
+    guard let failure else { return .done }
+    return isLocked(failure) ? .locked : .failed("\(failure.localizedDescription) (\(failure.domain) \(failure.code))")
+  }
+
+  /// The asset service refuses while something on the Mac holds the set.
+  static func isLocked(_ error: NSError) -> Bool {
+    error.userInfo["currentLockUsage"] != nil || error.localizedDescription.contains("current locks")
   }
 }
 
@@ -162,7 +232,7 @@ enum Settings {
   static func lockedByProfile(_ feature: Feature) -> Bool {
     guard feature.restrictions.isEmpty, feature.preferences.isEmpty else { return false }
     let profile = Profile.installed()
-    return profile.on && !profile.kept.contains(feature.id)
+    return profile.on && profile.ai && !profile.kept.contains(feature.id)
   }
 
   static func isForced(_ domain: String, _ key: String, value: Bool) -> Bool {
